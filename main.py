@@ -1,26 +1,29 @@
-import wmi
+import psutil
 import curses
 import time
+import sys
 from collections import defaultdict
 
 def get_process_memory_usage():
-    f = wmi.WMI()
     process_memory = defaultdict(int)
 
-    for process in f.Win32_Process():
-        process_name = process.Name
-        memory_usage_bytes = int(process.WorkingSetSize)  # Convert to integer for bytes
+    for process in psutil.process_iter(['name', 'memory_info']):
+        process_info = process.info
+        process_name = process_info['name']
+        memory_usage_bytes = process_info['memory_info'].rss  # Resident Set Size (RSS) in bytes
         memory_usage_mb = memory_usage_bytes / 1024 / 1024  # Convert bytes to megabytes
         process_memory[process_name] += memory_usage_mb  # Add memory usage to the total for that process
 
     return process_memory
 
-def is_process_responsive(process):
+def is_process_responsive(process_name):
     try:
-        # Try to get the CPU usage of the process
-        process.GetOwner()
-        return True
-    except Exception:
+        # Check if the process with the given name exists
+        for process in psutil.process_iter(attrs=['name']):
+            if process.info['name'] == process_name:
+                return True
+        return False
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return False
 
 def main(stdscr):
@@ -36,6 +39,9 @@ def main(stdscr):
 
     # Get terminal dimensions
     max_y, max_x = stdscr.getmaxyx()
+
+    # Dictionary to store timers for highlighted rows
+    row_timers = {}
 
     while True:
         process_memory = get_process_memory_usage()
@@ -54,11 +60,15 @@ def main(stdscr):
         # Iterate through the sorted data and print in columns, limiting rows
         for i, (process_name, memory_usage) in enumerate(sorted_data, start=1):
             if row < max_y - 1:  # Ensure it fits within the terminal
-                stdscr.addstr(row, 0, f"{i:<7} {process_name:<30} {memory_usage:.2f} MB", curses.A_BOLD)
+                # Check if the row has a timer set for red highlighting
+                if i in row_timers and row_timers[i] > time.time():
+                    stdscr.addstr(row, 0, f"{i:<7} {process_name:<30} {memory_usage:.2f} MB",
+                                  curses.A_BOLD | curses.color_pair(2))
+                else:
+                    stdscr.addstr(row, 0, f"{i:<7} {process_name:<30} {memory_usage:.2f} MB", curses.A_BOLD)
 
                 # Check if the process is responsive and label it accordingly
-                process = wmi.WMI().Win32_Process(Name=process_name)
-                if is_process_responsive(process[0]):
+                if is_process_responsive(process_name):
                     stdscr.addstr(row, 45, "        Responsive", curses.color_pair(1))
                 else:
                     stdscr.addstr(row, 45, "        Unresponsive", curses.color_pair(2))
@@ -66,6 +76,32 @@ def main(stdscr):
                 row += 1
 
         stdscr.refresh()
+
+        # Listen for user input (non-blocking)
+        stdscr.timeout(0)
+        user_input = stdscr.getch()
+        if user_input == ord('0'):  # Press '0' to quit the program
+            sys.exit()
+        elif ord('1') <= user_input <= ord('9'):  # Check if the input is between '1' and '9'
+            index_to_quit = int(chr(user_input)) - 1  # Convert ASCII code to an integer index
+            if 0 <= index_to_quit < len(sorted_data):
+                process_name_to_quit = sorted_data[index_to_quit][0]
+                try:
+                    # Terminate the process by PID (Process ID)
+                    for process in psutil.process_iter(attrs=['pid', 'name']):
+                        if process.info['name'] == process_name_to_quit:
+                            pid = process.info['pid']
+                            psutil.Process(pid).terminate()
+                            
+                            # Set a timer for red highlighting (5 seconds)
+                            row_timers[index_to_quit + 1] = time.time() + 5
+                            break
+                except psutil.NoSuchProcess:
+                    pass
+            else:
+                # If the index is out of bounds, inform the user
+                stdscr.addstr(max_y - 1, 0, "No process with that index number found", curses.A_BOLD)
+                stdscr.refresh()
 
         # Wait for 0.5 seconds (500 milliseconds) before updating again
         time.sleep(0.5)
